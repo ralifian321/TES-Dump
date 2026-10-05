@@ -1,0 +1,1263 @@
+NATIVE RVA HOOK MONITOR — BLUEPRINT PEMBUATAN APK
+===============================================
+
+TUJUAN
+------
+Membuat APK modul LSPosed baru yang tidak mempunyai fitur gameplay Ala Mobile.
+APK hanya berfungsi sebagai native runtime hook/monitor untuk target game IL2CPP.
+Target game dapat diganti melalui LSPosed Scope. APK game TIDAK direpack, TIDAK
+rebuild, dan libil2cpp.so game tetap berada di APK/proses game asli.
+
+FITUR YANG DITARGETKAN
+----------------------
+1. Masuk ke proses target melalui LSPosed/LibXposed.
+2. Menunggu dan mendeteksi libil2cpp.so di proses target.
+3. Membaca base address libil2cpp.so secara runtime.
+4. Resolve address = base + RVA.
+5. Monitor pemanggilan method pada RVA tertentu.
+6. Native inline hook dengan ShadowHook.
+7. ARM64 instruction intercept dengan ShadowHook.
+8. Membaca register ARM64 pada callback intercept.
+9. Mengubah parameter/return value melalui proxy/intercept bila signature sudah diketahui.
+10. Runtime patch byte terpisah dari ShadowHook, dengan backup + restore.
+11. Registry hook aktif: RVA, absolute address, mode, status, stub, original pointer.
+12. Tombol Enable/Disable/Restore per hook.
+13. Log runtime: base, RVA, absolute address, install/uninstall, invocation count,
+    register/argument snapshot yang dipilih, dan error ShadowHook.
+14. Target package custom/universal dari sisi konfigurasi LSPosed; kode native tidak
+    digabung dengan satu game tertentu.
+15. Arm64-v8a sebagai ABI utama.
+
+BATASAN PENTING
+---------------
+- ShadowHook adalah inline hook engine, bukan injector/profiler IL2CPP universal.
+- ShadowHook tidak mengetahui class/method IL2CPP. Nama method/RVA berasal dari metadata,
+  dump, analisis ELF, atau konfigurasi pengguna.
+- ShadowHook melakukan function hook/intercept. Direct arbitrary byte patch bukan
+  fungsi utama ShadowHook; untuk itu dibuat PatchEngine terpisah.
+- ShadowHook sendiri dapat menyediakan original-function/trampoline pointer setelah hook.
+  Trampoline custom yang sepenuhnya dikelola aplikasi adalah komponen berbeda dan tidak
+  perlu untuk versi pertama.
+- Memantau "semua method yang dipanggil" bukan fitur otomatis ShadowHook. Versi pertama
+  memonitor RVA/method yang dipilih.
+
+============================================================
+A. ANALISIS SOURCE 1 — BYTE-DANCE ANDROID-INLINE-HOOK 2.0.1
+============================================================
+
+SOURCE YANG DIANALISIS
+----------------------
+Folder: android-inline-hook-2.0.1/
+
+Bagian penting:
+- shadowhook/                  = library engine
+- app/                         = APK demo/test harness
+- systest/                     = system test
+- doc/manual.md                = kontrak API hook/intercept
+
+KESIMPULAN UTAMA
+----------------
+app/ BUKAN injector ke game lain.
+app/ adalah aplikasi demo yang memuat native library test ke proses APK-nya sendiri,
+lalu menggunakan ShadowHook untuk meng-hook library test/system yang terlihat dari
+proses itu.
+
+API SHADOWHOOK YANG DIPAKAI
+---------------------------
+Manual source menjelaskan:
+
+1. shadowhook_hook_func_addr()
+2. shadowhook_hook_func_addr_2()
+3. shadowhook_hook_sym_addr()
+4. shadowhook_hook_sym_addr_2()
+5. shadowhook_hook_sym_name()
+6. shadowhook_hook_sym_name_2()
+7. shadowhook_hook_sym_name_callback*()
+8. shadowhook_intercept_instr_addr()
+9. shadowhook_intercept_sym_addr()
+10. shadowhook_intercept_sym_name()
+11. shadowhook_unhook()
+12. shadowhook_unintercept()
+
+TARGET BISA DITENTUKAN DENGAN:
+- absolute address / instruction address
+- library name + symbol name
+
+FUNGSI HOOK
+-----------
+Hook menargetkan fungsi penuh.
+Caller memberikan proxy function dengan ABI/signature yang kompatibel dengan fungsi asli.
+Jika ingin meneruskan eksekusi ke fungsi asli, gunakan pointer original yang dikembalikan
+ShadowHook atau mekanisme macro yang sesuai mode hook.
+
+ORIGINAL / TRAMPOLINE
+---------------------
+Dokumentasi ShadowHook menjelaskan bahwa pada hook yang sukses, original address yang
+tersedia untuk caller menunjuk ke jalur trampoline/original-function chain yang diperlukan
+untuk memanggil implementasi asli tanpa memicu rekursi terhadap alamat function yang sudah
+ter-hook.
+
+Ini berarti kita TIDAK perlu menulis mesin trampoline ARM64 sendiri untuk function hook
+versi pertama.
+
+MODE
+----
+Source menyediakan konsep:
+- shared
+- multi
+- unique
+
+Ala Mobile menggunakan:
+ShadowHook.ConfigBuilder().setMode(ShadowHook.Mode.UNIQUE).build()
+
+Untuk module baru:
+- UNIQUE cocok untuk satu controller hook yang ingin memiliki target sendiri dan mudah
+  dikelola on/off.
+- MULTI berguna jika target memang perlu beberapa proxy.
+- SHARED dipakai bila chain antar hook dibutuhkan dan proxy mengikuti aturan stack cleanup
+  ShadowHook.
+
+REKOMENDASI VERSI PERTAMA: UNIQUE.
+
+INTERCEPT
+---------
+ShadowHook juga menyediakan instruction intercept.
+Callback menerima context CPU ARM64 sehingga register dapat dibaca/diubah.
+Ini digunakan bila target yang dipantau adalah instruction address, bukan hanya entry
+function.
+
+UNHOOK
+------
+shadowhook_unhook(stub)
+
+Stub yang dikembalikan saat install harus disimpan di registry agar tombol Disable/Restore
+bisa memanggil unhook dengan benar.
+
+AUTO-PENDING BY LIBRARY+SYMBOL
+------------------------------
+Manual menjelaskan bahwa hook berdasarkan library name + symbol dapat dicatat sebagai
+pending jika ELF belum loaded, lalu diselesaikan ketika ELF masuk.
+
+Untuk target IL2CPP berbasis RVA, kita tetap memakai pola:
+wait for libil2cpp.so -> get base -> base + RVA -> hook/intercept.
+
+SOURCE APP DEMO
+---------------
+APK demo source memiliki app/ dengan UI test. Ini hanya test harness untuk membuktikan
+ShadowHook, bukan UI untuk memilih game/RVA.
+
+============================================================
+B. ANALISIS SOURCE 2 — ALA MOBILE TOOL 1.0.3
+============================================================
+
+SOURCE YANG DIANALISIS
+----------------------
+Folder: ala-mobile-tool-1.0.3/
+
+STRUKTUR PENTING ALA
+--------------------
+app/
+  src/main/kotlin/tools/alamobile/mod/
+    AlaMobileModule.kt
+    NativeBridge.kt
+    ConfigActivity.kt
+    ... banyak komponen gameplay/UI
+
+app/src/main/resources/META-INF/xposed/
+    module.prop
+    java_init.list
+    scope.list
+
+native/src/
+    ala_core.c
+    il2cpp_hooks.c
+    pedal_hook.c
+    drs_hook.c
+    unlock_hook.c
+    music_hook.c
+    intro_hook.c
+    hide_pedals_hook.c
+    lap_hook.c
+    native_log.c
+
+native/CMakeLists.txt
+
+tools/run-il2cpp-dumper.sh
+
+docs/TECHNICAL_ANALYSIS.md
+
+BAGIAN YANG KITA AMBIL DARI ALA
+-------------------------------
+1. LibXposed/LSPosed module entry point.
+2. java_init.list.
+3. module.prop.
+4. scope.list.
+5. NativeBridge -> native .so.
+6. CMake + ShadowHook Prefab.
+7. Pola dl_iterate_phdr() untuk mendeteksi libil2cpp.so.
+8. Pola get_module_base("libil2cpp.so").
+9. Pola target = base + offset/RVA.
+10. shadowhook_hook_sym_addr().
+11. shadowhook_intercept_instr_addr().
+12. shadowhook_unhook().
+13. Error reporting shadowhook_get_errno()/shadowhook_to_errmsg().
+14. Delay native initialization sampai timing aman setelah package ready.
+15. Penanganan ClassLoader ganda dari source NativeBridge bila diperlukan.
+16. Pola build arm64-v8a.
+
+BAGIAN YANG DIBUANG
+-------------------
+Semua fitur spesifik game balapan:
+- pedal hook
+- throttle/brake/clutch
+- gear/shift
+- TC/ABS
+- DRS
+- billing/unlock
+- music hook
+- intro sound
+- hide pedals
+- lap timing
+- paddock/network
+- overlay pedal
+- gear UI
+- audio
+- EULA
+- update checker
+- donation/paywall
+- NPatch support jika target hanya LSPosed/root
+- game-version gate khusus Ala
+
+HASILNYA: native module baru jauh lebih kecil.
+
+============================================================
+C. ARSITEKTUR APK BARU
+============================================================
+
+NAMA CONTOH PROJECT
+-------------------
+NativeRvaHook
+
+STRUKTUR FINAL YANG DIREKOMENDASIKAN
+-------------------------------------
+NativeRvaHook/
+├── settings.gradle.kts
+├── build.gradle.kts
+├── gradle.properties
+├── gradle/libs.versions.toml
+├── gradlew
+├── app/
+│   ├── build.gradle.kts
+│   ├── proguard-rules.pro
+│   └── src/main/
+│       ├── AndroidManifest.xml
+│       ├── kotlin/com/example/nativervahook/
+│       │   ├── HookModule.kt
+│       │   ├── NativeBridge.kt
+│       │   ├── MainActivity.kt
+│       │   ├── HookConfig.kt
+│       │   ├── HookRegistry.kt
+│       │   └── LogBuffer.kt
+│       ├── cpp/
+│       │   ├── CMakeLists.txt
+│       │   └── src/
+│       │       ├── hook_core.c
+│       │       ├── rva_resolver.c
+│       │       ├── rva_resolver.h
+│       │       ├── hook_registry.c
+│       │       ├── hook_registry.h
+│       │       ├── patch_engine.c
+│       │       ├── patch_engine.h
+│       │       ├── intercept_engine.c
+│       │       ├── intercept_engine.h
+│       │       ├── native_log.c
+│       │       └── native_log.h
+│       └── resources/META-INF/xposed/
+│           ├── module.prop
+│           ├── java_init.list
+│           └── scope.list
+└── tools/
+    └── run-il2cpp-dumper.sh
+
+KOMPONEN UTAMA
+--------------
+HookModule.kt
+- Entry point LibXposed.
+- Dipanggil framework dalam proses target.
+- Tidak melakukan gameplay logic.
+- Menjadwalkan native initialization setelah timing package aman.
+
+NativeBridge.kt
+- Hanya bridge JNI.
+- Memuat libhookcore.so.
+- Expose fungsi init/install/remove/log/status ke UI bila diperlukan.
+
+libhookcore.so
+- Otak runtime.
+- Menginisialisasi ShadowHook.
+- Resolve libil2cpp.
+- Install hook/intercept.
+- Registry active hooks.
+- Patch engine.
+- Restore.
+
+libshadowhook.so / dependency com.bytedance.android:shadowhook:2.0.1
+- Engine inline hook/intercept.
+- BUKAN injector.
+- BUKAN metadata parser.
+- BUKAN IL2CPP dumper.
+
+LSPosed/LibXposed
+- Memuat module code ke proses package yang ada di Scope.
+- Memilih package target.
+- Menjadi mekanisme agar libhookcore.so benar-benar berjalan dalam proses game.
+
+IL2CPP Dumper
+- TOOL STATIC/RESEARCH.
+- Membaca libil2cpp.so + global-metadata.dat.
+- Menghasilkan dump class/method/field/RVA/metadata.
+- TIDAK melakukan hook runtime.
+
+============================================================
+D. TARGET GAME CUSTOM / UNIVERSAL
+============================================================
+
+KODE NATIVE TIDAK DIIKAT KE SATU GAME.
+
+Target dipilih melalui LSPosed Scope.
+Contoh:
+- com.example.game1
+- com.example.game2
+- package game lain
+
+APK tetap satu.
+Source native tetap satu.
+Yang berubah adalah target package dan konfigurasi RVA.
+
+PERLU DIPAHAMI:
+----------------
+`scope.list` pada APK hanya memberikan scope default/static. Pada pemakaian sebenarnya,
+LSPosed Manager tetap menjadi tempat memilih package target. Jadi "universal" di sini berarti
+mesin hook tidak meng-hardcode game balapan tertentu; pengguna memilih package yang diizinkan
+oleh LSPosed.
+
+UNTUK BUILD PERTAMA:
+scope.list dapat berisi satu package test.
+Setelah APK terinstal, package target dicentang di LSPosed.
+
+============================================================
+E. ALUR RUNTIME END-TO-END
+============================================================
+
+1. Install NativeRvaHook.apk.
+2. Aktifkan module di LSPosed.
+3. Centang satu target game pada Scope.
+4. Restart game.
+5. LibXposed memanggil HookModule dalam proses game.
+6. HookModule/NativeBridge memuat libhookcore.so.
+7. libhookcore.so menginisialisasi ShadowHook.
+8. Resolver menunggu libil2cpp.so.
+9. Resolver mengambil base address libil2cpp.so.
+10. Config target memberikan RVA.
+11. Address dihitung:
+       absolute = base + RVA
+12. Engine memvalidasi area target.
+13. User memilih:
+       MONITOR
+       FUNCTION HOOK
+       ARM64 INTERCEPT
+       PATCH
+14. Engine memasang operasi.
+15. Registry menyimpan stub/original/backup.
+16. Event masuk ke log buffer.
+17. UI menampilkan ACTIVE.
+18. Disable -> unhook / restore.
+19. Restart game -> keadaan proses kembali bersih jika tidak ada persistent patch di file.
+
+============================================================
+F. RVA RESOLVER
+============================================================
+
+FUNGSI:
+- cari module libil2cpp.so
+- ambil dlpi_addr / base address
+- normalisasi RVA
+- hitung target
+- validasi range
+
+SUMBER POLA DARI ALA
+--------------------
+Ala menggunakan dl_iterate_phdr() dan helper get_module_base("libil2cpp.so").
+Pola ini dipertahankan.
+
+API INTERNAL YANG DISARANKAN
+----------------------------
+uintptr_t rva_find_module_base(const char *module_name);
+uintptr_t rva_resolve_absolute(uintptr_t base, uintptr_t rva);
+int rva_is_readable(uintptr_t address, size_t length);
+int rva_is_executable(uintptr_t address, size_t length);
+
+LOG YANG DIHASILKAN
+-------------------
+MODULE libil2cpp.so
+BASE   0x........
+RVA    0x........
+ADDR   0x........
+PERM   RX/RW/...
+
+PENTING:
+RVA berasal dari versi binary tertentu. Update game dapat mengubah RVA.
+Tool harus menampilkan mismatch/error secara jelas.
+
+============================================================
+G. MONITOR METHOD CALL
+============================================================
+
+VERSI 1: MONITOR METHOD YANG SUDAH DIKETAHUI
+---------------------------------------------
+Input:
+- Class
+- Method
+- RVA
+- mode
+- optional return type/signature
+
+Engine kemudian meng-install hook/intercept pada target.
+
+OUTPUT:
+CALL #0001
+RVA      = 0x....
+ADDRESS  = 0x....
+PC       = 0x....
+X0..Xn   = ...
+RETURN   = ... (jika proxy function digunakan dan signature diketahui)
+COUNT    = 1
+
+CATATAN:
+ShadowHook tidak otomatis menginventaris semua managed method IL2CPP yang dipanggil.
+Untuk mengetahui RVA sebuah method, source project tetap membutuhkan dump/metadata/static
+analysis atau input manual.
+
+============================================================
+H. FUNCTION HOOK ENGINE
+============================================================
+
+Input:
+- target absolute address
+- proxy function
+- mode UNIQUE/MULTI/SHARED
+- optional original pointer
+
+Flow:
+base + RVA
+   -> shadowhook_hook_sym_addr(...)
+   -> stub
+   -> original pointer
+
+Registry entry minimal:
+struct HookEntry {
+    uint64_t id;
+    uint64_t rva;
+    uintptr_t address;
+    void *stub;
+    void *orig;
+    uint32_t mode;
+    uint32_t state;
+    uint64_t call_count;
+};
+
+STATE:
+0 = NONE
+1 = INSTALLING
+2 = ACTIVE
+3 = DISABLED
+4 = FAILED
+5 = RESTORED
+
+ON/OFF:
+- ON -> install hook.
+- OFF -> shadowhook_unhook(stub).
+- Restore -> clear state, free associated resources, restore patch bytes jika mode PATCH.
+
+JANGAN memanggil function asli melalui nama function yang sudah di-hook.
+Gunakan original/trampoline pointer sesuai kontrak ShadowHook.
+
+============================================================
+I. ARM64 INSTRUCTION INTERCEPT
+============================================================
+
+Gunakan saat yang dibutuhkan adalah register/instruction-level observation.
+
+API source:
+shadowhook_intercept_instr_addr(...)
+
+Callback mendapatkan CPU context.
+Tool dapat menampilkan register yang dipilih:
+- x0-x7 untuk argumen umum AAPCS64
+- x8-x18 bila diperlukan
+- x19-x28 callee-saved/context khusus
+- SP/PC/LR bila API context yang digunakan mengeksposnya
+
+UI:
+[ARM64 INTERCEPT]
+RVA: 0x........
+[INSTALL]
+
+LOG:
+PC=0x........
+X0=0x........
+X1=0x........
+...
+
+CHOOSE-ONLY LOGGING:
+Versi awal sebaiknya read-only.
+Jangan menulis register sampai target method/register telah divalidasi.
+
+============================================================
+J. UBAH RETURN VALUE / PARAMETER
+============================================================
+
+UNTUK FUNCTION HOOK:
+Proxy function dapat:
+- membaca parameter
+- mengubah parameter
+- memanggil original
+- mengganti return value
+- tidak memanggil original
+
+SYARAT UTAMA:
+Proxy harus kompatibel dengan ABI/signature target.
+Source ShadowHook menekankan bahwa receiving/passing parameter harus kompatibel di
+level CPU.
+
+UNTUK INTERCEPT:
+Context register dapat dibaca/diubah pada instruction point yang ditargetkan.
+Ini cocok untuk kasus ketika pengguna ingin mengubah nilai register ARM64 tanpa membuat
+proxy function penuh.
+
+============================================================
+K. PATCH ENGINE TERPISAH
+============================================================
+
+ShadowHook bukan generic byte patcher. Karena user membutuhkan opsi "ubah nilai di RVA",
+project baru sebaiknya memiliki PatchEngine terpisah.
+
+PatchEngine bertugas:
+1. Resolve address.
+2. Read original bytes.
+3. Simpan backup per hook ID.
+4. Ubah memory permission halaman bila diperlukan.
+5. Tulis patch bytes.
+6. Flush instruction cache.
+7. Mark ACTIVE.
+8. Restore original bytes ketika OFF/RESTORE.
+
+DATA:
+PatchEntry {
+    rva;
+    address;
+    original_bytes[];
+    patch_bytes[];
+    length;
+    state;
+}
+
+REKOMENDASI:
+- Backup bytes WAJIB.
+- Restore hanya dari backup yang dibuat dari proses yang sama.
+- Validasi panjang instruksi ARM64 = kelipatan 4 byte.
+- Jangan menganggap semua RVA adalah entry function.
+
+============================================================
+L. TRAMPOLINE VS ALLOCATED CODE
+============================================================
+
+1. SHADOWHOOK TRAMPOLINE
+------------------------
+Ini jalur yang direkomendasikan untuk Function Hook.
+ShadowHook mengelola redirect/original call chain untuk hook.
+Aplikasi menyimpan `orig`/stub yang dikembalikan ShadowHook.
+
+2. CUSTOM ALLOCATED TRAMPOLINE
+------------------------------
+Ini fitur terpisah dan tidak dibutuhkan versi pertama.
+Jika suatu saat dibutuhkan:
+- allocate executable/readable memory
+- emit ARM64 branch/relocation stub
+- handle branch range
+- flush icache
+- lifetime management
+- restore original bytes
+
+Ini lebih kompleks dan lebih raw dibanding memakai trampoline ShadowHook.
+Versi awal sebaiknya TIDAK mengimplementasikan custom code cave bila ShadowHook sudah
+memenuhi kebutuhan.
+
+============================================================
+M. HOOK REGISTRY / ACTIVE HOOKS
+============================================================
+
+Registry central wajib ada.
+
+Contoh record UI:
+
+ID  METHOD             RVA       ADDRESS        MODE       STATE
+1   get_Speed          0x....    0x....         HOOK       ACTIVE
+2   set_Value          0x....    0x....         INTERCEPT  ACTIVE
+3   FixedUpdate        0x....    0x....         PATCH      DISABLED
+
+Operasi:
+- Enable one
+- Disable one
+- Restore one
+- Enable all
+- Disable all
+- Restore all
+
+Disable HOOK != RESTORE PATCH:
+- Hook mode: unhook ShadowHook.
+- Patch mode: tulis kembali original bytes.
+
+============================================================
+N. UI APK BARU
+============================================================
+
+Tidak perlu Compose/Miuix/network bila ingin minimal.
+Plain Android Activity sudah cukup.
+
+SCREEN 1 — TARGET
+-----------------
+Target package: [ tampilkan process/package ]
+lib:            [ libil2cpp.so ]
+base:           [ runtime ]
+status:         [ WAITING / READY ]
+
+SCREEN 2 — ADD HOOK
+--------------------
+Class       [ optional ]
+Method      [ optional ]
+RVA         [ 0x........ ]
+Mode        [ Monitor | Hook | Intercept | Patch ]
+Return type [ optional ]
+Enabled     [ ON/OFF ]
+[ ADD ]
+
+SCREEN 3 — ACTIVE HOOKS
+------------------------
+List record:
+- RVA
+- address
+- mode
+- call count
+- active state
+[OFF]
+[RESTORE]
+
+SCREEN 4 — LOG
+---------------
+Base / RVA resolution.
+ShadowHook result / errno.
+Invocation count.
+Optional register snapshot.
+Patch backup/restore.
+
+============================================================
+O. LSPOSED / XPOSED METADATA
+============================================================
+
+module.prop:
+minApiVersion=101
+targetApiVersion=102
+staticScope=true/atau sesuai kebutuhan release
+version=1.0.0
+versionCode=10000
+
+java_init.list:
+com.example.nativervahook.HookModule
+
+scope.list:
+isi package target default untuk test.
+
+Saat penggunaan universal:
+- APK tidak perlu dibangun ulang setiap berganti game.
+- Ganti package target di LSPosed Scope.
+- RVA/method config bisa diganti dari UI/config.
+
+============================================================
+P. MANIFEST / DEPENDENCY MINIMAL
+============================================================
+
+Tidak perlu:
+- INTERNET
+- billing
+- storage permission lama
+- overlay permission kecuali nanti memang UI overlay dibuat
+- Paddock/network
+
+Perlu minimal:
+- application
+- activity untuk config
+- LSPosed/LibXposed metadata resources
+
+Java/Kotlin dependency:
+- io.github.libxposed:api 102.0.0 (compileOnly)
+- service 102.0.0 hanya jika API/service dari source memang diperlukan
+
+Native:
+- com.bytedance.android:shadowhook:2.0.1
+
+============================================================
+Q. BUILD CONFIG BERDASARKAN SOURCE YANG DIANALISIS
+============================================================
+
+Ala Mobile 1.0.3 memakai:
+- AGP 9.3.1
+- Kotlin 2.4.10
+- compileSdk 37
+- targetSdk 35
+- minSdk 26
+- NDK 26.1.10909125
+- CMake 3.22.1+
+- arm64-v8a
+- ShadowHook 2.0.1
+- LibXposed API 102.0.0
+
+Untuk module baru, pertahankan baseline ini agar build environment mengikuti source yang
+sudah terbukti membangun Ala.
+
+`app/build.gradle.kts` minimal perlu:
+- android.application plugin
+- Kotlin plugin
+- compileSdk 37
+- minSdk 26
+- targetSdk 35
+- ndkVersion = "26.1.10909125"
+- abiFilters += "arm64-v8a"
+- externalNativeBuild CMake
+- dependency ShadowHook 2.0.1
+- compileOnly LibXposed API
+- implementation yang benar-benar diperlukan saja
+
+CMake minimal:
+- project native C11
+- find_package(shadowhook REQUIRED CONFIG)
+- add_library(hookcore SHARED ...)
+- target_link_libraries(hookcore log shadowhook::shadowhook)
+
+============================================================
+R. IL2CPP DUMPER SH SCRIPT
+============================================================
+
+Source Ala mempunyai:
+tools/run-il2cpp-dumper.sh
+
+Ia:
+1. Mengharapkan libil2cpp.so.
+2. Mengharapkan global-metadata.dat.
+3. Download Il2CppDumper v6.7.46 bila belum ada.
+4. Menjalankan dotnet Il2CppDumper.dll terhadap dua file tersebut.
+5. Menaruh hasil dump.
+6. Ala kemudian mengolah offset menjadi OffsetTable.kt.
+
+FUNGSI DALAM PROJECT BARU
+-------------------------
+Script ini hanya untuk persiapan data hook.
+Tidak dijalankan di proses game.
+Tidak dibutuhkan saat APK hook sedang berjalan.
+
+PIPELINE:
+
+GAME APK / RESEARCH ARTIFACT
+       |
+       +-- libil2cpp.so
+       |
+       +-- global-metadata.dat
+       v
+run-il2cpp-dumper.sh
+       v
+Il2CppDumper
+       v
+DummyDump / dump.cs / script.json / metadata
+       v
+ambil Method RVA + Field Offset
+       v
+HookConfig / UI
+       v
+Runtime base + RVA
+       v
+ShadowHook / Intercept / Patch
+
+UNTUK TARGET CUSTOM:
+Script jangan memakai nama package hardcoded.
+Gunakan argumen:
+./tools/run-il2cpp-dumper.sh <libil2cpp.so> <global-metadata.dat> <output-dir>
+
+Dengan itu tool bisa dipakai ke game yang berbeda.
+
+CATATAN:
+global-metadata.dat + libil2cpp.so harus berasal dari versi game yang cocok.
+Kalau binary/metadata mismatched, RVA/dump tidak valid.
+
+============================================================
+S. PROSES EKSTRAKSI ARTIFACT TARGET
+============================================================
+
+Tujuan:
+- mendapatkan libil2cpp.so target
+- mendapatkan global-metadata.dat target
+- menjaga keduanya dari build/version yang sama
+
+Output yang disimpan:
+research/<package>/<version>/<abi>/
+  libil2cpp.so
+  global-metadata.dat
+  dump/
+
+APK hook TIDAK perlu membawa file-file tersebut.
+Mereka hanya menjadi data riset/config.
+
+============================================================
+T. KONFIGURASI METHOD/RVA
+============================================================
+
+Untuk setiap target method:
+
+HookSpec
+--------
+package
+library
+class_name
+method_name
+rva
+mode
+signature
+return_type
+enabled
+restore_policy
+log_level
+
+Contoh generik:
+package = com.example.target
+library = libil2cpp.so
+class = ExampleClass
+method = ExampleMethod
+rva = 0x123456
+mode = HOOK
+enabled = true
+
+Jangan masukkan RVA sebagai hardcoded constant di source native.
+RVA sebaiknya datang dari config/registry sehingga APK tetap universal.
+
+============================================================
+U. STARTUP / TIMING
+============================================================
+
+Ala Mobile menemukan masalah bila ShadowHook/native initialization dijalankan terlalu awal
+pada beberapa perangkat/framework.
+
+Karena itu model baru juga perlu:
+
+onPackageLoaded / onPackageReady
+        |
+        v
+Handler.post / deferred init
+        |
+        v
+context/process siap
+        |
+        v
+ShadowHook.init(...)
+        |
+        v
+load hookcore
+        |
+        v
+wait libil2cpp
+        |
+        v
+resolve + install
+
+Jangan menaruh operasi berat di callback framework sebelum keadaan proses aman.
+
+============================================================
+V. NATIVE INITIALIZATION CONTRACT
+============================================================
+
+Urutan:
+
+Native init
+  1. verify arm64
+  2. ShadowHook init UNIQUE
+  3. start module resolver
+  4. detect libil2cpp
+  5. set base
+  6. notify Java/UI READY
+
+Bila libil2cpp belum ada:
+- state WAITING
+- retry/backoff
+- jangan menghitung base dari address 0
+
+Bila target sudah loaded:
+- lanjut resolve
+
+Bila hook install gagal:
+- ambil shadowhook_get_errno()
+- shadowhook_to_errmsg()
+- registry state FAILED
+
+============================================================
+W. FILE YANG HARUS DIBUANG DARI ALA
+============================================================
+
+app/Kotlin:
+- Config/network/paddock classes
+- overlay classes
+- billing Java hook
+- music
+- intro sound
+- EULA/update/checker jika tidak diperlukan
+
+native:
+- pedal_hook.c/.h
+- drs_hook.c/.h
+- unlock_hook.c/.h
+- music_hook.c/.h
+- intro_hook.c/.h
+- hide_pedals_hook.c/.h
+- lap_hook.c/.h
+
+Pertahankan konsep:
+- native_log.c/.h
+- base resolver
+- ShadowHook integration
+- NativeBridge
+- LibXposed module entry
+
+`il2cpp_hooks.c` versi Ala tidak dijadikan mesin hook utama; nama file itu di source saat ini
+lebih berupa modul helper/legacy dan API native feature. Project baru langsung membuat
+`hook_core.c` sendiri agar registry + install/uninstall terpusat.
+
+============================================================
+X. FILE BUILD FINAL — RINGKASAN
+============================================================
+
+Java/Kotlin:
+HookModule.kt
+NativeBridge.kt
+MainActivity.kt
+HookConfig.kt
+HookRegistry.kt
+LogBuffer.kt
+
+Native C:
+hook_core.c
+rva_resolver.c
+hook_registry.c
+intercept_engine.c
+patch_engine.c
+native_log.c
+
+Metadata:
+module.prop
+java_init.list
+scope.list
+
+Dependency:
+libxposed API
+ShadowHook 2.0.1
+
+Tool:
+run-il2cpp-dumper.sh
+
+============================================================
+Y. BUILD APK DI TERMUX
+============================================================
+
+PERANGKAT/SDK YANG HARUS TERSEDIA
+----------------------------------
+- JDK yang kompatibel (source Ala menggunakan JVM 17 untuk compile; Gradle dapat berjalan
+  dengan Java lebih baru jika kompatibel dengan AGP, tetapi compileOptions tetap 17)
+- Android SDK Platform 37
+- Build Tools 36.1.0
+- NDK 26.1.10909125
+- CMake 3.22.1+
+- Gradle wrapper dari project
+
+BUILD DEBUG:
+./gradlew :app:assembleDebug
+
+OUTPUT:
+app/build/outputs/apk/debug/app-debug.apk
+
+BUILD RELEASE:
+./gradlew :app:assembleRelease
+
+Jika release signing belum dikonfigurasi, gunakan debug build untuk uji lokal.
+
+============================================================
+Z. PEMASANGAN DAN AKTIVASI
+============================================================
+
+1. Install APK module seperti APK biasa.
+2. Buka LSPosed Manager.
+3. Aktifkan NativeRvaHook.
+4. Scope -> pilih package game target.
+5. Tutup/restart game target.
+6. Buka NativeRvaHook untuk konfigurasi jika UI dipakai.
+7. Pastikan log menunjukkan:
+   module loaded
+   native loaded
+   ShadowHook initialized
+   libil2cpp.so base found
+8. Tambahkan HookSpec.
+9. Install MONITOR dulu.
+10. Verifikasi CALL COUNT.
+11. Baru uji HOOK/INTERCEPT/PATCH.
+
+Tidak perlu:
+- repack APK game
+- rebuild game
+- menyalin libil2cpp.so ke APK module
+- membuat injector APK terpisah
+
+============================================================
+AA. TESTING PHASE YANG BENAR
+============================================================
+
+FASE 1 — Loader
+------------
+Target: proses game terdeteksi.
+Expected:
+- onModuleLoaded
+- hookcore loaded
+
+FASE 2 — IL2CPP resolver
+------------------------
+Expected:
+libil2cpp.so base != 0
+
+FASE 3 — RVA monitor
+--------------------
+Target satu method.
+Expected:
+CALL COUNT bertambah saat method benar-benar dipanggil.
+
+FASE 4 — Function hook
+----------------------
+Gunakan signature yang telah divalidasi.
+Expected:
+proxy dipanggil, original pointer valid jika dipakai.
+
+FASE 5 — ARM64 intercept
+-------------------------
+Target instruction yang telah divalidasi.
+Expected:
+PC/register log muncul.
+
+FASE 6 — Patch
+--------------
+Baru setelah monitoring stabil.
+Expected:
+write -> active -> disable -> restore original bytes.
+
+============================================================
+AB. KESELAMATAN / STABILITAS IMPLEMENTASI
+============================================================
+
+1. Selalu validasi base + RVA.
+2. Jangan memasang hook ke address 0.
+3. Simpan stub dari ShadowHook.
+4. Simpan original pointer.
+5. Jangan pernah menganggap signature IL2CPP dari nama method saja sudah cukup.
+6. AAPCS64/ABI harus cocok.
+7. Untuk patch ARM64, panjang instruction 4-byte aligned.
+8. Backup original bytes sebelum direct patch.
+9. Restore harus idempotent.
+10. Jangan membuat writer thread jika tidak diperlukan.
+11. Jangan mengubah memory saat mode MONITOR.
+12. Default UI = READ ONLY / MONITOR.
+
+============================================================
+AC. FITUR YANG AKAN MENJADI HASIL APK
+============================================================
+
+MAIN:
+- Target process
+- libil2cpp base
+- status
+
+METHOD MONITOR:
+- Class
+- Method
+- RVA
+- install monitor
+- call count
+
+HOOK:
+- install
+- active
+- disable
+- restore
+- original pointer status
+
+INTERCEPT:
+- install
+- active
+- register readout
+- disable
+
+PATCH:
+- RVA
+- original bytes
+- patch bytes
+- enable
+- restore
+
+ACTIVE HOOKS:
+- all hooks
+- state
+- call count
+- address
+- error
+
+LOG:
+- runtime resolver
+- ShadowHook errors
+- install/uninstall
+- optional ARM64 context
+
+============================================================
+AD. APA YANG TIDAK BOLEH DISAMAKAN
+============================================================
+
+LSPosed != ShadowHook
+- LSPosed memasukkan module ke proses target berdasarkan Scope.
+
+ShadowHook != IL2CppDumper
+- ShadowHook melakukan runtime hook/intercept.
+- Il2CppDumper menganalisis binary + metadata secara offline.
+
+libhookcore.so != libshadowhook.so
+- libhookcore = controller logic milik project kita.
+- libshadowhook = engine hook dari ByteDance.
+
+PATCH != HOOK
+- Patch mengubah instruction bytes.
+- Hook mengarahkan function execution ke proxy.
+
+INTERCEPT != HOOK PROXY
+- Intercept bekerja pada instruction/context.
+- Hook bekerja pada function entry/proxy.
+
+============================================================
+AE. KONTRAK IMPLEMENTASI FINAL
+============================================================
+
+PROJECT BARU HARUS:
+1. Menggunakan source Android-inline-hook 2.0.1 hanya sebagai engine/dependency ShadowHook.
+2. Menggunakan source Ala Mobile 1.0.3 hanya sebagai referensi implementasi LSPosed +
+   NativeBridge + resolver + ShadowHook integration.
+3. Menghapus semua feature code balapan.
+4. Tidak merepack atau rebuild target game.
+5. Menargetkan package melalui LSPosed Scope.
+6. Menargetkan libil2cpp.so melalui runtime module resolver.
+7. Menjadikan RVA sebagai data/config, bukan constant gameplay feature.
+8. Menyediakan MONITOR -> HOOK -> INTERCEPT -> PATCH.
+9. Menyediakan ON/OFF/RESTORE.
+10. Menampilkan active hook registry.
+11. Menyediakan IL2CPP dumper script terpisah dari runtime APK.
+12. Fokus ARM64-v8a untuk perangkat target.
+
+============================================================
+AF. REFERENSI SOURCE YANG SUDAH DIPERIKSA
+============================================================
+
+ANDROID-INLINE-HOOK 2.0.1
+- doc/manual.md
+- README.md
+- app/
+- shadowhook/
+- systest/
+
+ALA MOBILE TOOL 1.0.3
+- app/src/main/kotlin/tools/alamobile/mod/AlaMobileModule.kt
+- app/src/main/kotlin/tools/alamobile/mod/NativeBridge.kt
+- app/src/main/resources/META-INF/xposed/module.prop
+- app/src/main/resources/META-INF/xposed/java_init.list
+- app/src/main/resources/META-INF/xposed/scope.list
+- native/CMakeLists.txt
+- native/src/ala_core.c
+- native/src/il2cpp_hooks.c
+- native/src/pedal_hook.c
+- native/src/drs_hook.c
+- native/src/lap_hook.c
+- native/src/unlock_hook.c
+- docs/TECHNICAL_ANALYSIS.md
+- docs/MODULE_ABS_NOTES.md
+- tools/run-il2cpp-dumper.sh
+
+============================================================
+AG. STATUS ANALISIS
+============================================================
+
+SUDAH TERBUKTI DARI SOURCE:
+- Ala adalah LSPosed/LibXposed module.
+- Ala menggunakan ShadowHook 2.0.1.
+- Ala mencari base libil2cpp.so.
+- Ala menghitung base + offset/RVA.
+- Ala memakai shadowhook_hook_sym_addr().
+- Ala memakai shadowhook_intercept_instr_addr().
+- Ala memakai shadowhook_unhook().
+- Ala memiliki NativeBridge untuk masuk ke native .so.
+- Ala mempunyai build arm64-v8a.
+- Ala mempunyai script Il2CppDumper untuk riset static.
+- ShadowHook menyediakan function hook, intercept, original/trampoline chain, dan unhook.
+
+BAGIAN YANG MERUPAKAN DESAIN BARU:
+- HookSpec universal.
+- Generic hook registry.
+- Generic UI method/RVA.
+- Generic PatchEngine.
+- Generic monitor/call counter.
+- Generic active hook list.
+- Custom target configuration.
+- Removal total fitur balapan.
+
+============================================================
+AH. HASIL AKHIR YANG DIHARAPKAN
+============================================================
+
+Satu APK:
+
+NativeRvaHook.apk
+
+        LSPosed
+           |
+           v
+     target game process
+           |
+           +--- libil2cpp.so
+           |
+           +--- libhookcore.so
+           |        |
+           |        +--- RVA resolver
+           |        +--- hook registry
+           |        +--- monitor
+           |        +--- intercept
+           |        +--- patch/restore
+           |
+           +--- libshadowhook.so
+                    |
+                    +--- function hook
+                    +--- trampoline/original chain
+                    +--- instruction intercept
+
+APK game tetap asli.
+Tidak ada repack.
+Tidak ada fitur pedal/gas/DRS.
+Tidak ada network/paddock/billing.
+Fokus penuh pada native runtime hook dan RVA monitoring.
+
+END OF BLUEPRINT
+================
